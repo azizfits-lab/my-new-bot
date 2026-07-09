@@ -148,7 +148,9 @@ HELIUS_WEBHOOKS_URL = "https://api.helius.xyz/v0/webhooks"
 # الـ Polling كيبقى خدام دايماً كـ "شبكة أمان" حتى لو فعلتي الـ Webhook، حيت
 # قاعدة البيانات كتمنع التكرار (UNIQUE signature) — بلا خطر ديال إشعارات مكررة.
 WEBHOOK_LISTEN_HOST = "0.0.0.0"
-WEBHOOK_LISTEN_PORT = 8080
+# 🔧 Render (وخدمات Cloud مشابهة) كيعطيو رقم المنفذ عبر متغير بيئة PORT —
+# خاصنا نستعملوه، وإلا الخدمة كتفشل بـ "No open ports detected"
+WEBHOOK_LISTEN_PORT = int(os.environ.get("PORT", 8080))
 WEBHOOK_PATH = "/helius-webhook"
 
 # --- 🆕 Watchdog (فحص صحة البوت) ---
@@ -1883,9 +1885,15 @@ async def helius_webhook_handler(request: web.Request):
     return web.json_response({"ok": True})
 
 
+async def health_check_handler(request: web.Request):
+    """🔧 Route بسيط باش خدمات Cloud (Render وغيرها) يتأكدو أن البوت حي وخدام"""
+    return web.json_response({"status": "ok", "service": "whale-tracker-bot"})
+
+
 def build_webhook_web_app(bot) -> web.Application:
     app = web.Application()
     app["bot"] = bot
+    app.router.add_get("/", health_check_handler)
     app.router.add_post(WEBHOOK_PATH, helius_webhook_handler)
     return app
 
@@ -2693,14 +2701,15 @@ async def run_bot_forever():
 
     app = build_application()
 
-    web_runner = None
-    if get_setting("webhook_enabled") == "1":
-        web_app = build_webhook_web_app(app.bot)
-        web_runner = web.AppRunner(web_app)
-        await web_runner.setup()
-        site = web.TCPSite(web_runner, WEBHOOK_LISTEN_HOST, WEBHOOK_LISTEN_PORT)
-        await site.start()
-        logger.info(f"🌐 Webhook Server خدام على المنفذ {WEBHOOK_LISTEN_PORT} (المسار: {WEBHOOK_PATH})")
+    # 🔧 نشغلو سيرفر خفيف دايماً (بلا شرط) — خاص خدمات بحال Render لي كتحتاج
+    # الخدمة تفتح Port، وإلا كتعتبرها "فشلات". إذا الـ Webhook مفعّل، نفس
+    # السيرفر كيستقبل الـ Push ديال Helius زيادة على الـ Health Check.
+    web_app = build_webhook_web_app(app.bot)
+    web_runner = web.AppRunner(web_app)
+    await web_runner.setup()
+    site = web.TCPSite(web_runner, WEBHOOK_LISTEN_HOST, WEBHOOK_LISTEN_PORT)
+    await site.start()
+    logger.info(f"🌐 Health/Webhook Server خدام على المنفذ {WEBHOOK_LISTEN_PORT}")
 
     async with app:
         await app.start()
