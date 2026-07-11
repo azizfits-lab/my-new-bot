@@ -133,7 +133,6 @@ DEFAULT_MUTE_WHALE = False
 DEFAULT_MUTE_SMART_MONEY = False
 DEFAULT_MUTE_MULTI_WALLET = False
 DEFAULT_MUTE_NEW_POSITION = False
-DEFAULT_MUTE_SELL_EXIT = False
 
 # --- إعدادات الأداء الجديدة ---
 DEXSCREENER_CACHE_TTL_SECONDS = 30       # كل شحال نخزنو بيانات التوكن قبل ما نطلبوها مرة أخرى
@@ -340,6 +339,19 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_pending_1h ON trade_outcomes(evaluated_1h, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_pending_24h ON trade_outcomes(evaluated_24h, ts)")
 
+    # 🆕 ATH (All-Time High) — أعلى Market Cap/سعر وصلهم التوكن منذ ما بدا
+    # البوت يتابعه (ماشي ATH الحقيقي التاريخي الكامل، لكن مفيد جداً باش
+    # تشوف "شحال طاح من القمة" منذ ما دخل البوت فالراديو ديالك)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS token_ath (
+            mint TEXT PRIMARY KEY,
+            ath_mcap REAL NOT NULL,
+            ath_price REAL NOT NULL,
+            ath_ts INTEGER NOT NULL,
+            first_seen_ts INTEGER NOT NULL
+        )
+    """)
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_tx_wallet_mint ON transactions(wallet_address, mint, action)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_tx_mint_action_time ON transactions(mint, action, timestamp)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp)")
@@ -372,7 +384,6 @@ def init_db():
         "mute_smart_money": "1" if DEFAULT_MUTE_SMART_MONEY else "0",
         "mute_multi_wallet": "1" if DEFAULT_MUTE_MULTI_WALLET else "0",
         "mute_new_position": "1" if DEFAULT_MUTE_NEW_POSITION else "0",
-        "mute_sell_exit": "1" if DEFAULT_MUTE_SELL_EXIT else "0",
         # 🆕 إعدادات Webhook (Phase 3)
         "polling_enabled": "1",   # Polling خدام بالدفولت (شبكة أمان)
         "webhook_enabled": "0",   # Webhook متوقف حتى تفعله بـ /setwebhook
@@ -879,6 +890,41 @@ def get_top_performers(window: str = "24h", min_sample: int = 5, limit: int = 10
     return results[:limit]
 
 
+# ---------------- 🆕 ATH Tracking (منذ ما بدا البوت يتابع التوكن) ----------------
+
+def update_token_ath(mint: str, mcap: float, price: float) -> dict:
+    """
+    كيسجل/يحدث أعلى Market Cap وصلها التوكن. كيرجع dict فيه ath_mcap الحالي
+    (سواء تبدل دابا أو لا) باش نقدرو نحسبو "شحال طاح من القمة".
+    """
+    if not mcap or mcap <= 0:
+        return None
+    now = int(time.time())
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM token_ath WHERE mint = ?", (mint,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute(
+            "INSERT INTO token_ath (mint, ath_mcap, ath_price, ath_ts, first_seen_ts) VALUES (?, ?, ?, ?, ?)",
+            (mint, mcap, price, now, now)
+        )
+        conn.commit()
+        conn.close()
+        return {"ath_mcap": mcap, "ath_price": price, "is_new_ath": True}
+
+    result = {"ath_mcap": row["ath_mcap"], "ath_price": row["ath_price"], "is_new_ath": False}
+    if mcap > row["ath_mcap"]:
+        cur.execute(
+            "UPDATE token_ath SET ath_mcap = ?, ath_price = ?, ath_ts = ? WHERE mint = ?",
+            (mcap, price, now, mint)
+        )
+        conn.commit()
+        result = {"ath_mcap": mcap, "ath_price": price, "is_new_ath": True}
+    conn.close()
+    return result
+
+
 # ---------------- 🆕 Digest Queue (فلترة الضجة) ----------------
 
 def add_to_digest_queue(wallet_name: str, symbol: str, mint: str, score: int, score_label: str, usd_value: float):
@@ -1035,6 +1081,15 @@ async def get_token_market_data(session: aiohttp.ClientSession, mint: str):
         else:
             token_age_str = f"{int(age_seconds // 86400)} يوم"
 
+    # 🆕 روابط اجتماعية (Twitter/Telegram/Website) — مجانية عند DexScreener،
+    # ماشي كل التوكنات عندها (خصوصاً التوكنات الجديدة بزاف أو المشبوهة)
+    info_block = best_pair.get("info") or {}
+    socials = info_block.get("socials") or []
+    websites = info_block.get("websites") or []
+    twitter_url = next((s.get("url") for s in socials if s.get("type") == "twitter"), None)
+    telegram_url = next((s.get("url") for s in socials if s.get("type") == "telegram"), None)
+    website_url = websites[0].get("url") if websites else None
+
     result = {
         "symbol": best_pair.get("baseToken", {}).get("symbol", "?"),
         "price_usd": float(best_pair.get("priceUsd") or 0),
@@ -1046,10 +1101,18 @@ async def get_token_market_data(session: aiohttp.ClientSession, mint: str):
         "price_change_1h": float(best_pair.get("priceChange", {}).get("h1") or 0),
         "price_change_24h": float(best_pair.get("priceChange", {}).get("h24") or 0),
         # 🆕 صورة/شعار العملة (إذا كانت متوفرة عند DexScreener — ماشي كل التوكنات عندها)
-        "image_url": (best_pair.get("info") or {}).get("imageUrl"),
+        "image_url": info_block.get("imageUrl"),
         # 🆕 من وين التوكن (Raydium, PumpFun, Meteora...) — باش نزيدو روابط منصات
         # حقيقية بس (مثلاً Pump.fun غير إذا التوكن فعلاً منها، بلا رابط ميت)
         "dex_id": (best_pair.get("dexId") or "").lower(),
+        # 🆕 حضور اجتماعي — مؤشر جودة/جدية إضافي (توكن بلا Twitter/Telegram = علامة استفهام)
+        "twitter_url": twitter_url,
+        "telegram_url": telegram_url,
+        "website_url": website_url,
+        # 🆕 نسبة الشراء/البيع (Buy/Sell Pressure) — من نفس استجابة DexScreener
+        # لي عندنا ديجا، بلا أي طلب إضافي. مؤشر قوي بزاف فثقافة الميم كوينز.
+        "buys_h1": int((best_pair.get("txns", {}).get("h1") or {}).get("buys") or 0),
+        "sells_h1": int((best_pair.get("txns", {}).get("h1") or {}).get("sells") or 0),
     }
     dexscreener_cache.set(mint, result)
     return result
@@ -1583,11 +1646,11 @@ async def broadcast_with_image(bot, admin_chat_id: str, text: str, image_url: st
 
 def build_trade_message(wallet_name, wallet_address, parsed, market_data, buyers_windows: dict,
                          score: int = None, score_label: str = None, signal_counts: dict = None,
-                         rug_data: dict = None) -> tuple:
+                         rug_data: dict = None, ath_data: dict = None) -> tuple:
     """
-    🆕 رسالة احترافية كاملة: Token Score، Rug Check، Smart Narrative، عدد
-    المشترين حسب النافذة الزمنية، ومجموعة روابط موسّعة (DexScreener, Birdeye,
-    Jupiter, Pump.fun, Photon, GMGN, Solscan) — كل قسم مفصول ومُعنون بوضوح.
+    🆕 رسالة احترافية كاملة: Token Score، Rug Check، Smart Narrative، ATH
+    Tracking (شحال طاح/طلع من القمة)، Buy/Sell Pressure، حضور اجتماعي
+    (Twitter/Telegram/Website)، Graduation Status (Pump.fun)، وروابط موسّعة.
     """
     action = parsed["action"]
     mint = parsed["mint"]
@@ -1613,6 +1676,45 @@ def build_trade_message(wallet_name, wallet_address, parsed, market_data, buyers
     # 🆕 Pump.fun غير إذا التوكن فعلاً طالع من Pump.fun/PumpSwap (بلا رابط ميت لتوكنات Raydium/Orca عادية)
     dex_id = (market_data.get("dex_id") or "") if market_data else ""
     pumpfun_line = f"<a href='https://pump.fun/{mint}'>Pump.fun</a> · " if "pump" in dex_id else ""
+
+    # 🆕 Graduation Status — معلومة أساسية فثقافة ميم كوينز Solana: واش
+    # التوكن مازال فـ Bonding Curve (خطر عالي، سيولة صناعية) ولا "تخرج"
+    # (Graduated) لـ AMM حقيقي (Raydium/PumpSwap) بسيولة حقيقية
+    graduation_line = ""
+    if dex_id == "pumpfun":
+        graduation_line = "🌱 <b>الحالة:</b> مازال فـ Bonding Curve (Pump.fun) — قبل التخرج\n"
+    elif dex_id == "pumpswap":
+        graduation_line = "🎓 <b>الحالة:</b> تخرج من Pump.fun (Graduated) → PumpSwap\n"
+
+    # 🆕 ATH Tracking — شحال طاح/طلع من أعلى قمة وصلها منذ ما بدا البوت يتابعها
+    ath_line = ""
+    if ath_data:
+        if ath_data.get("is_new_ath"):
+            ath_line = "🚀 <b>قمة سعرية جديدة (ATH)</b> منذ ما بدا التتبع!\n"
+        elif ath_data.get("ath_mcap"):
+            drawdown = ((mcap - ath_data["ath_mcap"]) / ath_data["ath_mcap"]) * 100 if ath_data["ath_mcap"] > 0 else 0
+            ath_line = f"📊 <b>من القمة (ATH):</b> {drawdown:+.1f}% (أعلى MC: ${ath_data['ath_mcap']:,.0f})\n"
+
+    # 🆕 Buy/Sell Pressure (آخر ساعة) — من نفس بيانات DexScreener، بلا نداء إضافي
+    pressure_line = ""
+    if market_data:
+        buys_h1 = market_data.get("buys_h1", 0)
+        sells_h1 = market_data.get("sells_h1", 0)
+        total_h1 = buys_h1 + sells_h1
+        if total_h1 > 0:
+            buy_pct = (buys_h1 / total_h1) * 100
+            pressure_line = f"⚖️ <b>ضغط الشراء (1h):</b> {buys_h1} شراء / {sells_h1} بيع ({buy_pct:.0f}% شراء)\n"
+
+    # 🆕 حضور اجتماعي — Twitter/Telegram/Website (من نفس بيانات DexScreener)
+    social_links = []
+    if market_data:
+        if market_data.get("twitter_url"):
+            social_links.append(f"<a href='{market_data['twitter_url']}'>🐦 Twitter</a>")
+        if market_data.get("telegram_url"):
+            social_links.append(f"<a href='{market_data['telegram_url']}'>📱 Telegram</a>")
+        if market_data.get("website_url"):
+            social_links.append(f"<a href='{market_data['website_url']}'>🌍 Website</a>")
+    social_line = f"🔗 <b>حضور اجتماعي:</b> {' · '.join(social_links)}\n" if social_links else "⚠️ <b>بلا حضور اجتماعي</b> (بلا Twitter/Telegram/Website)\n"
 
     tx_time = datetime.fromtimestamp(parsed["timestamp"]).strftime("%H:%M:%S")
     divider = "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️"
@@ -1648,6 +1750,10 @@ def build_trade_message(wallet_name, wallet_address, parsed, market_data, buyers
         f"{divider}\n"
         f"{score_line}"
         f"{rug_line}"
+        f"{graduation_line}"
+        f"{ath_line}"
+        f"{pressure_line}"
+        f"{social_line}"
         f"{divider}\n"
         f"{narrative_block}"
         f"💼 <b>المحفظة:</b> {wallet_name}\n"
@@ -1690,7 +1796,6 @@ def build_runtime_settings() -> dict:
         "mute_smart_money": raw_settings.get("mute_smart_money", "0") == "1",
         "mute_multi_wallet": raw_settings.get("mute_multi_wallet", "0") == "1",
         "mute_new_position": raw_settings.get("mute_new_position", "0") == "1",
-        "mute_sell_exit": raw_settings.get("mute_sell_exit", "0") == "1",
         "min_token_score": int(raw_settings.get("min_token_score", 0)),
         "digest_enabled": raw_settings.get("digest_enabled", "1") == "1",
     }
@@ -1708,30 +1813,9 @@ async def handle_parsed_transaction(session, bot, admin_chat_id, name, address, 
         mint = parsed["mint"]
         action = parsed["action"]
 
-        # 🆕 Exit Alert: البيع ما كيدخلش فخط التحليل الكامل (Score/Rug Check/
-        # Narrative/Win-Rate) لأنها تحليلات مبنية على "الدخول"، ماشي "الخروج".
-        # لكن كيبعث تنبيه خفيف وسريع (Wallet Sold) — معلومة مهمة (خروج محفظة
-        # متابَعة) بلا ما يبطئ المعالجة بتحليل ماعندوش فائدة هنا.
+        # 🔧 حسب طلبك: البوت كيتابع الشراء (BUY) فقط — أي عملية بيع كتترمى
+        # مباشرة، بلا أي تنبيه وبلا تسجيل.
         if action == "SELL":
-            if settings.get("mute_sell_exit"):
-                return
-            market_data = await get_token_market_data(session, mint)
-            symbol = market_data["symbol"] if market_data else "?"
-            price = market_data["price_usd"] if market_data else 0
-            usd_value = (parsed["amount"] or 0) * price
-            if usd_value < settings["min_usd_alert"]:
-                return
-            exit_msg = (
-                f"🔴 <b>Wallet Sold (Exit)</b>\n"
-                f"▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
-                f"💼 <b>{name}</b> باعت <b>{symbol}</b>\n"
-                f"💵 <b>القيمة:</b> ${usd_value:,.2f}\n"
-                f"<code>{mint}</code>\n"
-                f"▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n"
-                f"🔗 <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a> · "
-                f"<a href='https://axiom.trade/t/{mint}'>Axiom</a>"
-            )
-            await broadcast(bot, admin_chat_id, exit_msg)
             return
 
         is_first_buy_for_wallet = not wallet_has_bought_before(address, mint)
@@ -1763,8 +1847,13 @@ async def handle_parsed_transaction(session, bot, admin_chat_id, name, address, 
         signal_counts = get_signal_event_counts(mint)
         score, score_label = calculate_token_score(market_data, distinct_buyers_ever, signal_counts)
 
+        # 🆕 ATH Tracking — كنسجلو/نحدثو أعلى Market Cap وصلها التوكن منذ ما بدا البوت يتابعها
+        ath_data = None
+        if market_data:
+            ath_data = update_token_ath(mint, market_data["market_cap"], market_data["price_usd"])
+
         message, _, _ = build_trade_message(
-            name, address, parsed, market_data, buyers_windows, score, score_label, signal_counts, rug_data
+            name, address, parsed, market_data, buyers_windows, score, score_label, signal_counts, rug_data, ath_data
         )
 
         log_trade(name, address, action, symbol, mint, parsed["amount"], usd_value, parsed["signature"])
@@ -2130,9 +2219,14 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         ["📌 Add Wallet", "📋 Wallet List"],
         ["❌ Remove Wallet", "✏️ Rename Wallet"],
         ["⚙ Settings", "📊 Statistics"],
-        ["📤 Export", "💾 Backup"],
-        ["👀 Watchlist", "🏆 Top Wallets"],
-        ["📅 Daily", "🗓 Weekly"],
+        ["🔬 Analyze", "🛡️ Rug Check"],
+        ["🧠 Token Score", "🔍 Search"],
+        ["📈 Wallet Stats", "⚡ Wallet Activity"],
+        ["🏆 Top Wallets", "🥇 Top Performers"],
+        ["👀 Watchlist", "📤 Export"],
+        ["💾 Backup", "📅 Daily"],
+        ["🗓 Weekly", "📆 Monthly"],
+        ["❓ Help"],
     ],
     resize_keyboard=True
 )
@@ -2360,12 +2454,11 @@ def build_settings_text_and_keyboard():
     mute_sm = "🔇 مكتوم" if s.get("mute_smart_money") == "1" else "🔊 مفعّل"
     mute_mw = "🔇 مكتوم" if s.get("mute_multi_wallet") == "1" else "🔊 مفعّل"
     mute_np = "🔇 مكتوم" if s.get("mute_new_position") == "1" else "🔊 مفعّل"
-    mute_sell = "🔇 مكتوم" if s.get("mute_sell_exit") == "1" else "🔊 مفعّل"
 
     text = (
         f"⚙ <b>الإعدادات الحالية</b>\n\n"
         f"🟢 إشعارات Buy: {buy_status}\n"
-        f"ℹ️ التحليل الكامل (Score/Rug Check) غير للشراء — البيع تنبيه خفيف (Exit) بس\n"
+        f"ℹ️ البوت كيتابع الشراء (BUY) فقط — البيع بلا أي تنبيه\n"
         f"💵 الحد الأدنى للإشعار: ${s.get('min_usd_alert')}\n"
         f"🐋 حد Whale Alert: ${s.get('whale_usd_threshold')}\n"
         f"🎯 الحد الأدنى لـ Token Score: {s.get('min_token_score', '0')}/100\n"
@@ -2376,8 +2469,7 @@ def build_settings_text_and_keyboard():
         f"🐋 Whale: {mute_whale}\n"
         f"🔥 Smart Money: {mute_sm}\n"
         f"🚀 Multi Wallet: {mute_mw}\n"
-        f"🆕 New Position: {mute_np}\n"
-        f"🔴 Sell/Exit Alert: {mute_sell}\n\n"
+        f"🆕 New Position: {mute_np}\n\n"
         f"استعمل الأزرار تحت باش تبدل، أو هاد الأوامر:\n"
         f"/setminusd [مبلغ] — بدل الحد الأدنى\n"
         f"/setwhale [مبلغ] — بدل حد Whale\n"
@@ -2389,7 +2481,6 @@ def build_settings_text_and_keyboard():
         [InlineKeyboardButton(f"🔥 Smart Money: {mute_sm}", callback_data="toggle_mute_sm")],
         [InlineKeyboardButton(f"🚀 Multi Wallet: {mute_mw}", callback_data="toggle_mute_mw")],
         [InlineKeyboardButton(f"🆕 New Position: {mute_np}", callback_data="toggle_mute_np")],
-        [InlineKeyboardButton(f"🔴 Sell/Exit: {mute_sell}", callback_data="toggle_mute_sell")],
     ])
     return text, keyboard
 
@@ -2409,7 +2500,6 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "toggle_mute_sm": "mute_smart_money",
         "toggle_mute_mw": "mute_multi_wallet",
         "toggle_mute_np": "mute_new_position",
-        "toggle_mute_sell": "mute_sell_exit",
     }
     key = toggle_map.get(query.data)
     if key:
@@ -2595,15 +2685,11 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ 🆕 إحصائيات محفظة معينة ============
 
-async def wallet_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("استعمل: /walletstats [عنوان المحفظة]")
-        return
-    address = context.args[0]
+def build_wallet_stats_text(address: str):
+    """🆕 دالة مشتركة: كتبني نص إحصائيات المحفظة — تُستعمل من /walletstats والزر التفاعلي"""
     wallet = get_wallet_by_address(address)
     if not wallet:
-        await update.message.reply_text("⚠️ ماكايناش هاد المحفظة.")
-        return
+        return None
     stats = get_wallet_stats(address)
     win_1h = get_wallet_win_rate(address, window="1h")
     win_24h = get_wallet_win_rate(address, window="24h")
@@ -2613,7 +2699,7 @@ async def wallet_stats_command(update: Update, context: ContextTypes.DEFAULT_TYP
             return f"— (مازال ما كافيش بيانات مقيّمة)"
         return f"{w['win_rate_pct']}% (متوسط: {w['avg_return_pct']:+.1f}%، على {w['sample_size']} صفقة)"
 
-    text = (
+    return (
         f"📊 <b>إحصائيات محفظة {wallet['name']}</b>\n\n"
         f"🟢 عدد صفقات Buy: {stats['buy_count']}\n"
         f"💵 إجمالي المشتريات: ${stats['total_buy_usd']:,.2f}\n"
@@ -2622,31 +2708,42 @@ async def wallet_stats_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"⏱ بعد 1 ساعة: {format_winrate(win_1h)}\n"
         f"📅 بعد 24 ساعة: {format_winrate(win_24h)}"
     )
+
+
+async def wallet_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("استعمل: /walletstats [عنوان المحفظة]")
+        return
+    text = build_wallet_stats_text(context.args[0])
+    if text is None:
+        await update.message.reply_text("⚠️ ماكايناش هاد المحفظة.")
+        return
     await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ============ 🆕 Top Performers (Win-Rate Leaderboard) ============
 
-async def top_performers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    استعمل: /topperformers [1h|24h] — أفضل المحافظ حسب Win-Rate حقيقي
-    (ماشي عدد الصفقات)، مع فلترة (min_sample=5) باش الرقم يكون موثوق.
-    """
-    window = context.args[0] if context.args and context.args[0] in ("1h", "24h") else "24h"
+def build_top_performers_text(window: str = "24h") -> str:
+    """🆕 دالة مشتركة: كتبني نص Top Performers — تُستعمل من /topperformers وزر 1h/24h"""
     performers = get_top_performers(window=window, min_sample=5, limit=10)
     if not performers:
-        await update.message.reply_text(
+        return (
             "ماكاينش بيانات كافية بعد (خاص صفقات مقيّمة على الأقل 5 لكل محفظة). "
             "استناى شوية باش يتجمع بيانات كافية."
         )
-        return
     text = f"🏆 <b>Top Performers — Win-Rate ({window})</b>\n\n"
     for i, p in enumerate(performers, 1):
         text += (
             f"{i}. <b>{p['wallet_name']}</b>: {p['win_rate_pct']}% "
             f"(متوسط: {p['avg_return_pct']:+.1f}%، {p['sample_size']} صفقة)\n"
         )
-    await update.message.reply_text(text, parse_mode="HTML")
+    return text
+
+
+async def top_performers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استعمل: /topperformers [1h|24h] — أو دوس الزر 🥇 Top Performers فالقائمة"""
+    window = context.args[0] if context.args and context.args[0] in ("1h", "24h") else "24h"
+    await update.message.reply_text(build_top_performers_text(window), parse_mode="HTML")
 
 
 # ============ 🆕 Rug Check (فحص أمان العقد) ============
@@ -2704,6 +2801,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     signal_counts = get_signal_event_counts(mint)
     score, score_label = calculate_token_score(market_data, distinct_buyers_ever, signal_counts)
     risk_score, risk_label, warnings = calculate_rug_risk(rug_data)
+    ath_data = update_token_ath(mint, market_data["market_cap"], market_data["price_usd"])
 
     # 🆕 Cross-Check: نقارنو السعر مع مصدر ثاني مجاني (Jupiter) باش نتأكدو
     # أن المعلومة موثوقة (ماشي غالطة/متأخرة من مصدر وحيد)
@@ -2716,6 +2814,41 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price_verified_line = "✅ <b>السعر موثّق</b> (مطابق بين DexScreener و Jupiter)\n"
         else:
             price_verified_line = f"⚠️ <b>فرق فالسعر بين المصادر</b> ({diff_pct:.1f}%) — تأكد قبل ما تعتمد عليه\n"
+
+    # 🆕 Graduation Status
+    graduation_line = ""
+    dex_id_check = market_data.get("dex_id") or ""
+    if dex_id_check == "pumpfun":
+        graduation_line = "🌱 <b>الحالة:</b> مازال فـ Bonding Curve (Pump.fun) — قبل التخرج\n"
+    elif dex_id_check == "pumpswap":
+        graduation_line = "🎓 <b>الحالة:</b> تخرج من Pump.fun (Graduated) → PumpSwap\n"
+
+    # 🆕 ATH Tracking
+    if ath_data.get("is_new_ath"):
+        ath_line = "🚀 <b>قمة سعرية جديدة (ATH)</b> منذ ما بدا التتبع!\n"
+    else:
+        ath_mcap = ath_data.get("ath_mcap") or 0
+        drawdown = ((market_data["market_cap"] - ath_mcap) / ath_mcap * 100) if ath_mcap > 0 else 0
+        ath_line = f"📊 <b>من القمة (ATH):</b> {drawdown:+.1f}% (أعلى MC: ${ath_mcap:,.0f})\n"
+
+    # 🆕 Buy/Sell Pressure
+    buys_h1 = market_data.get("buys_h1", 0)
+    sells_h1 = market_data.get("sells_h1", 0)
+    total_h1 = buys_h1 + sells_h1
+    pressure_line = ""
+    if total_h1 > 0:
+        buy_pct = (buys_h1 / total_h1) * 100
+        pressure_line = f"⚖️ <b>ضغط الشراء (1h):</b> {buys_h1} شراء / {sells_h1} بيع ({buy_pct:.0f}% شراء)\n"
+
+    # 🆕 حضور اجتماعي
+    social_links = []
+    if market_data.get("twitter_url"):
+        social_links.append(f"<a href='{market_data['twitter_url']}'>🐦 Twitter</a>")
+    if market_data.get("telegram_url"):
+        social_links.append(f"<a href='{market_data['telegram_url']}'>📱 Telegram</a>")
+    if market_data.get("website_url"):
+        social_links.append(f"<a href='{market_data['website_url']}'>🌍 Website</a>")
+    social_line = f"🔗 <b>حضور اجتماعي:</b> {' · '.join(social_links)}\n" if social_links else "⚠️ <b>بلا حضور اجتماعي</b> (بلا Twitter/Telegram/Website)\n"
 
     change_pct = market_data.get("price_change_1h") or market_data.get("price_change_24h") or 0
     window_label = "ساعة" if market_data.get("price_change_1h") else "24 ساعة"
@@ -2740,6 +2873,10 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧠 <b>Token Score:</b> {score}/100 {score_label_emoji(score_label)} ({score_label})\n"
         f"🛡️ <b>فحص الأمان:</b> {risk_label} ({risk_score}/100)\n"
         f"{price_verified_line}"
+        f"{graduation_line}"
+        f"{ath_line}"
+        f"{pressure_line}"
+        f"{social_line}"
         f"{divider}\n"
         f"💬 <i>{narrative}</i>\n"
         f"{divider}\n"
@@ -2827,6 +2964,113 @@ async def backup_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============================================================
+# 🆕 نظام الأزرار الذكي — بلا ما تحتاج تكتب أي أمر يدوياً
+# ============================================================
+# فكرة: الأزرار لي محتاجة "معلومة" (عنوان توكن، عنوان محفظة) كتسولك عليها
+# بزر أو بسؤال بسيط، بدل ما تكتب الأمر كامل بالأقواس يدوياً.
+
+# ---- 1) أزرار كتسول على Contract Address أو نص بحث (تنتظر رسالتك الجاية) ----
+
+async def prompt_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_command"] = "analyze"
+    await update.message.reply_text("🔬 ابعت الـ Contract Address ديال العملة لي بغيتي تحللها:")
+
+
+async def prompt_rugcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_command"] = "rugcheck"
+    await update.message.reply_text("🛡️ ابعت الـ Contract Address ديال العملة لفحص الأمان ديالها:")
+
+
+async def prompt_tokenscore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_command"] = "tokenscore"
+    await update.message.reply_text("🧠 ابعت الـ Contract Address ديال العملة لحساب الـ Score ديالها:")
+
+
+async def prompt_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_command"] = "search"
+    await update.message.reply_text("🔍 ابعت العنوان (Contract) أو رمز العملة لي بغيتي تبحث عليه:")
+
+
+async def handle_awaiting_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    🆕 كيتفعل غير إذا كان كاين "سؤال معلق" (awaiting_command) من زر سابق —
+    خلاف ذلك كيتجاهل الرسالة تماماً (باش ما يردش بشكل غريب على أي نص عشوائي).
+    """
+    awaiting = context.user_data.pop("awaiting_command", None)
+    if not awaiting:
+        return  # ماكاين حتى سؤال معلق — نتجاهلو الرسالة
+
+    text = update.message.text.strip()
+    if awaiting == "search":
+        context.args = text.split()
+    else:
+        context.args = [text]
+
+    handler_map = {
+        "analyze": analyze_command,
+        "rugcheck": rug_check_command,
+        "tokenscore": token_score_command,
+        "search": search_command,
+    }
+    func = handler_map.get(awaiting)
+    if func:
+        await func(update, context)
+
+
+# ---- 2) أزرار Wallet Stats / Wallet Activity — بلا كتابة، غير اختيار من لائحة ----
+
+async def show_wallet_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, action_prefix: str, title: str):
+    wallets_list = get_all_wallets()
+    if not wallets_list:
+        await update.message.reply_text("ماكاينش محافظ مضافة حالياً. زيد وحدة أول بـ 📌 Add Wallet.")
+        return
+    buttons = [
+        [InlineKeyboardButton(w["name"], callback_data=f"{action_prefix}:{w['address']}")]
+        for w in wallets_list
+    ]
+    await update.message.reply_text(title, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def prompt_wallet_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_wallet_picker(update, context, "wstat", "📈 اختار المحفظة لعرض الإحصائيات:")
+
+
+async def prompt_wallet_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_wallet_picker(update, context, "wact", "⚡ اختار المحفظة لعرض الـ Activity Score:")
+
+
+async def wallet_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prefix, address = query.data.split(":", 1)
+    if prefix == "wstat":
+        text = build_wallet_stats_text(address)
+    else:
+        text = build_wallet_activity_text(address)
+    if text is None:
+        text = "⚠️ هاد المحفظة تحذفات."
+    await query.message.reply_text(text, parse_mode="HTML")
+
+
+# ---- 3) زر Top Performers — اختيار 1h/24h بلا كتابة ----
+
+async def prompt_top_performers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏱ آخر ساعة", callback_data="topperf:1h")],
+        [InlineKeyboardButton("📅 آخر 24 ساعة", callback_data="topperf:24h")],
+    ])
+    await update.message.reply_text("🥇 اختار المدة:", reply_markup=keyboard)
+
+
+async def top_performers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, window = query.data.split(":", 1)
+    text = build_top_performers_text(window)
+    await query.message.reply_text(text, parse_mode="HTML")
+
+
 # ============ إلغاء ============
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2872,28 +3116,34 @@ async def token_score_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ============ 🆕 Wallet Activity Score ============
 
-async def wallet_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("استعمل: /walletactivity [عنوان المحفظة]")
-        return
-    address = context.args[0]
+def build_wallet_activity_text(address: str):
+    """🆕 دالة مشتركة: كتبني نص Wallet Activity — تُستعمل من /walletactivity وزر الاختيار"""
     wallet = get_wallet_by_address(address)
     if not wallet:
-        await update.message.reply_text("⚠️ ماكايناش هاد المحفظة.")
-        return
+        return None
     activity_data = get_wallet_activity_data(address)
     score, label = calculate_wallet_activity_score(activity_data)
     last_seen = (
         datetime.fromtimestamp(activity_data["last_trade_ts"]).strftime("%Y-%m-%d %H:%M")
         if activity_data["last_trade_ts"] else "—"
     )
-    text = (
+    return (
         f"⚡ <b>Wallet Activity Score — {wallet['name']}</b>\n\n"
         f"📊 Score: <b>{score}/100</b> ({label})\n"
         f"🔢 إجمالي الصفقات: {activity_data['total_trades']}\n"
         f"🎯 عدد التوكنات المختلفة: {activity_data['distinct_mints']}\n"
         f"🕒 آخر نشاط: {last_seen}"
     )
+
+
+async def wallet_activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("استعمل: /walletactivity [عنوان المحفظة]")
+        return
+    text = build_wallet_activity_text(context.args[0])
+    if text is None:
+        await update.message.reply_text("⚠️ ماكايناش هاد المحفظة.")
+        return
     await update.message.reply_text(text, parse_mode="HTML")
 
 
@@ -3092,11 +3342,25 @@ def build_application() -> Application:
     app.add_handler(MessageHandler(filters.Regex("^🏆 Top Wallets$"), top_wallets_command))
     app.add_handler(MessageHandler(filters.Regex("^📅 Daily$"), daily_summary))
     app.add_handler(MessageHandler(filters.Regex("^🗓 Weekly$"), weekly_summary))
+    # ---- 🆕 أزرار جداد: تحليل، فحص أمان، بحث، إحصائيات محفظة — بلا كتابة أوامر يدوياً ----
+    app.add_handler(MessageHandler(filters.Regex("^🔬 Analyze$"), prompt_analyze))
+    app.add_handler(MessageHandler(filters.Regex("^🛡️ Rug Check$"), prompt_rugcheck))
+    app.add_handler(MessageHandler(filters.Regex("^🧠 Token Score$"), prompt_tokenscore))
+    app.add_handler(MessageHandler(filters.Regex("^🔍 Search$"), prompt_search))
+    app.add_handler(MessageHandler(filters.Regex("^📈 Wallet Stats$"), prompt_wallet_stats))
+    app.add_handler(MessageHandler(filters.Regex("^⚡ Wallet Activity$"), prompt_wallet_activity))
+    app.add_handler(MessageHandler(filters.Regex("^🥇 Top Performers$"), prompt_top_performers))
+    app.add_handler(MessageHandler(filters.Regex("^📆 Monthly$"), monthly_summary))
+    app.add_handler(MessageHandler(filters.Regex("^❓ Help$"), help_command))
 
     # ---- أزرار الإعدادات التفاعلية (Inline) ----
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^toggle_"))
     # ---- 🆕 زر عرض المعرف (ID) للمشاهدين الجداد ----
     app.add_handler(CallbackQueryHandler(show_my_id_callback, pattern="^show_my_id$"))
+    # ---- 🆕 أزرار اختيار المحفظة (Wallet Stats / Wallet Activity) ----
+    app.add_handler(CallbackQueryHandler(wallet_picker_callback, pattern="^(wstat|wact):"))
+    # ---- 🆕 زر اختيار المدة لـ Top Performers ----
+    app.add_handler(CallbackQueryHandler(top_performers_callback, pattern="^topperf:"))
 
     # ---- أوامر الإعدادات النصية ----
     app.add_handler(CommandHandler("setminusd", set_min_usd))
@@ -3128,6 +3392,11 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("setwebhook", set_webhook_command))
     app.add_handler(CommandHandler("disablewebhook", disable_webhook_command))
     app.add_handler(CommandHandler("webhookstatus", webhook_status_command))
+
+    # ---- 🆕 Handler عام (لازم يكون آخر واحد): كيستقبل الجواب على الأسئلة
+    # المعلقة (awaiting_command) من أزرار Analyze/Rug Check/Token Score/Search.
+    # ماكيتفعلش إلا كي ماكاين حتى Regex/Command آخر طابق قبلو.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_awaiting_text_input))
 
     # ---- الخدمة الدورية (Polling على Helius) — خدامة دايماً كشبكة أمان ----
     app.job_queue.run_repeating(monitor_job, interval=POLLING_INTERVAL_SECONDS, first=10)
