@@ -136,7 +136,8 @@ DEFAULT_MUTE_NEW_POSITION = False
 
 # --- إعدادات الأداء الجديدة ---
 DEXSCREENER_CACHE_TTL_SECONDS = 30       # كل شحال نخزنو بيانات التوكن قبل ما نطلبوها مرة أخرى
-MAX_CONCURRENT_WALLET_CHECKS = 8          # عدد المحافظ اللي كيتفحصو بالتوازي فنفس الوقت
+MAX_CONCURRENT_WALLET_CHECKS = 4           # 🔧 تقليل من 8 لـ 4 (كان كيضرب Rate Limit ديال Helius)
+STAGGER_INTERVAL_SECONDS = 0.5              # 🆕 فاصل زمني بين انطلاق كل طلب محفظة (توزيع الحمل)
 API_RETRY_ATTEMPTS = 3                     # عدد محاولات إعادة الطلب عند فشل مؤقت
 API_RETRY_BASE_DELAY = 1.5                 # ثواني (كيتضاعف: 1.5, 3, 6 ...)
 
@@ -223,7 +224,7 @@ def with_retry(attempts: int = API_RETRY_ATTEMPTS, base_delay: float = API_RETRY
             for attempt in range(1, attempts + 1):
                 try:
                     return await func(*args, **kwargs)
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                except (aiohttp.ClientError, asyncio.TimeoutError, RateLimitedError) as e:
                     last_error = e
                     if attempt < attempts:
                         delay = base_delay * (2 ** (attempt - 1))
@@ -1555,15 +1556,30 @@ def build_smart_narrative(symbol: str, mint: str, change_pct: float, window: str
 wallet_check_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WALLET_CHECKS)
 
 
-@with_retry()
+class RateLimitedError(Exception):
+    """🆕 استثناء خاص بـ 429 (Rate Limit) — كيخلي with_retry يعاود المحاولة بدل ما نستسلمو بصمت"""
+    pass
+
+
+@with_retry(attempts=4, base_delay=2.0)
 async def fetch_transactions(session: aiohttp.ClientSession, address: str):
     url = HELIUS_URL.format(address=address)
     params = {"api-key": HELIUS_API_KEY, "limit": 10}
     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        if resp.status == 429:
+            # 🔧 إصلاح مهم: قبل كان الكود كيرجع [] بصمت عند 429 (Rate Limit)
+            # — يعني البوت "يعمى" على المحفظة هاد الدورة كاملة بلا ما يعاود
+            # المحاولة. دابا كنرفعو استثناء خاص باش with_retry يعاود المحاولة
+            # مع Backoff (ويحترم Retry-After إذا Helius بعتاه).
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                await asyncio.sleep(min(float(retry_after), 10))
+            raise RateLimitedError(f"429 Rate Limited للمحفظة {address}")
         if resp.status != 200:
             logger.warning(f"Helius API رجع status {resp.status} للمحفظة {address}")
             return []
         return await resp.json()
+
 
 
 def parse_transaction(tx: dict, wallet_address: str):
@@ -1988,12 +2004,16 @@ async def handle_parsed_transaction(session, bot, admin_chat_id, name, address, 
         logger.error(f"❌ خطأ فمعالجة صفقة للمحفظة {name} ({address}): {e}")
 
 
-async def process_wallet(session, bot, admin_chat_id, wallet, settings):
+async def process_wallet(session, bot, admin_chat_id, wallet, settings, stagger_delay: float = 0):
     """
     🆕 معالجة محفظة واحدة عبر Polling (فحص + تنبيهات) — معزولة تماماً بـ
     try/except باش غلطة فمحفظة وحدة ما تأثرش على الباقي. كتخدم بالتوازي
-    مع محافظ أخرى عبر asyncio.gather + Semaphore فـ check_all_wallets.
+    مع محافظ أخرى، لكن مع stagger_delay (فاصل زمني) قبل ما تبدا، باش
+    الطلبات ما توصلش كلها لـ Helius فنفس المللي-ثانية (سبب Rate Limit 429).
     """
+    if stagger_delay:
+        await asyncio.sleep(stagger_delay)
+
     address = wallet["address"]
     name = wallet["name"]
     last_seen_signature = wallet["last_signature"]
@@ -2042,9 +2062,10 @@ async def process_wallet(session, bot, admin_chat_id, wallet, settings):
 
 async def check_all_wallets(bot, admin_chat_id: str):
     """
-    🆕 النسخة المحسنة: كتفحص كل المحافظ بالتوازي (asyncio.gather) بدل
-    واحد بواحد، مع Semaphore باش تحترم حدود الـ API المجاني، وحماية شاملة
-    من الأعطال (خطأ فمحفظة وحدة ما يوقفش الباقي).
+    🆕 النسخة المصلحة: كتفحص كل المحافظ بالتوازي المحدود، لكن مع تفريق زمني
+    خفيف (Stagger) بين انطلاق كل طلب — قبل، كل المحافظ (حتى لو 12+) كانو
+    كيطلقو الطلب فنفس المللي-ثانية بالضبط، وهذا كان كيضرب Rate Limit ديال
+    Helius (429) لكل المحافظ دفعة وحدة، كل 12 ثانية، بلا ما يعاود يحاول.
     """
     wallets_list = get_all_wallets()
     if not wallets_list:
@@ -2056,8 +2077,8 @@ async def check_all_wallets(bot, admin_chat_id: str):
 
     async with aiohttp.ClientSession() as session:
         tasks = [
-            process_wallet(session, bot, admin_chat_id, wallet, settings)
-            for wallet in wallets_list
+            process_wallet(session, bot, admin_chat_id, wallet, settings, stagger_delay=i * STAGGER_INTERVAL_SECONDS)
+            for i, wallet in enumerate(wallets_list)
         ]
         # return_exceptions=True: حتى لو وقع خطأ غير متوقع فمهمة وحدة، الباقي كيكمل
         results = await asyncio.gather(*tasks, return_exceptions=True)
