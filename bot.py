@@ -115,10 +115,10 @@ def log_trade(wallet_name, wallet_address, action, symbol, mint, amount, usd_val
 
 BOT_TOKEN = "8845375695:AAERECGAvRvSnY6EjeInZdE9vsmb1Q6y7-E"
 ADMIN_CHAT_ID = "6009339320"
-HELIUS_API_KEY = "9857ad32-4483-4e09-9471-ca5652333c7e"
+HELIUS_API_KEY = "2a6c359f-9561-4167-9dea-32a2f055f8b8"
 
 DATABASE_NAME = "wallets.db"
-POLLING_INTERVAL_SECONDS = 12
+POLLING_INTERVAL_SECONDS = 30  # 🔧 كان 12 — بطّأناه لتقليص استهلاك Helius Credits (كل فحص محفظة = طلب)
 
 DEFAULT_NOTIFY_BUY = True
 DEFAULT_NOTIFY_SELL = True
@@ -143,6 +143,9 @@ API_RETRY_BASE_DELAY = 1.5                 # ثواني (كيتضاعف: 1.5, 3,
 
 # --- 🆕 فلترة الضجة (Alert Fatigue) — عتبة أدنى للـ Score قبل ما نبعتو تنبيه كامل ---
 DEFAULT_MIN_TOKEN_SCORE = 0   # 0 = بلا فلترة (كيما كان قبل)
+# 🆕 Rug Check (3 نداءات RPC) غير يخدم للصفقات لي قيمتها فوق هاد الرقم —
+# توفير كبير لكريدي Helius (صفقة بـ$2 ماخصهاش تستهلك نفس الفحص ديال صفقة بـ$5000)
+RUG_CHECK_MIN_USD_VALUE = 20
 DEFAULT_DIGEST_ENABLED = True
 DIGEST_INTERVAL_SECONDS = 1800  # كل 30 دقيقة كنبعتو ملخص للصفقات "الضعيفة" لي تفلترات
 
@@ -209,6 +212,34 @@ dexscreener_cache = SimpleTTLCache(DEXSCREENER_CACHE_TTL_SECONDS)
 
 
 # ============================================================
+# 🧠 Adaptive Throttle — حماية ذكية من استنزاف كريدي Helius
+# ============================================================
+# 🆕 إذا البوت واجه Rate Limit (429) بشكل متكرر خلال وقت قصير، معناها
+# الكريدي قريب يخلص أو الحمل زايد. بدل ما يكمل يحاول (وكل محاولة فاشلة
+# غالباً كتستهلك كريدي زادة)، البوت كيبطئ روحو تلقائياً لمدة، ويعلم
+# الأدمن مرة وحدة، ومنبعد كيرجع للسرعة العادية وحدو بلا تدخل يدوي.
+
+_adaptive_state = {"consecutive_rate_limits": 0, "throttled_until": 0, "alert_sent": False}
+RATE_LIMIT_THRESHOLD = 3          # عدد الحوادث المتتالية قبل ما نبطّئو
+THROTTLE_COOLDOWN_SECONDS = 900    # 15 دقيقة راحة قبل ما نعاودو نحاولو بالسرعة العادية
+
+
+def _mark_rate_limit_incident():
+    _adaptive_state["consecutive_rate_limits"] += 1
+    if _adaptive_state["consecutive_rate_limits"] >= RATE_LIMIT_THRESHOLD:
+        _adaptive_state["throttled_until"] = time.time() + THROTTLE_COOLDOWN_SECONDS
+
+
+def _mark_rate_limit_recovered():
+    _adaptive_state["consecutive_rate_limits"] = 0
+    _adaptive_state["alert_sent"] = False
+
+
+def is_currently_throttled() -> bool:
+    return time.time() < _adaptive_state["throttled_until"]
+
+
+# ============================================================
 # 🔁 Retry + Exponential Backoff (لطلبات الشبكة)
 # ============================================================
 
@@ -223,9 +254,13 @@ def with_retry(attempts: int = API_RETRY_ATTEMPTS, base_delay: float = API_RETRY
             last_error = None
             for attempt in range(1, attempts + 1):
                 try:
-                    return await func(*args, **kwargs)
+                    result = await func(*args, **kwargs)
+                    _mark_rate_limit_recovered()  # 🆕 نجحت = البوت "بخير"، نصفرو العداد
+                    return result
                 except (aiohttp.ClientError, asyncio.TimeoutError, RateLimitedError) as e:
                     last_error = e
+                    if isinstance(e, RateLimitedError):
+                        _mark_rate_limit_incident()  # 🆕 نسجلو الحادثة (Adaptive Throttle)
                     if attempt < attempts:
                         delay = base_delay * (2 ** (attempt - 1))
                         logger.warning(
@@ -1159,7 +1194,7 @@ def create_backup(filepath: str):
 # 3. Holder Concentration: واش Top 10 حاملين عندهم نسبة كبيرة (خطر تلاعب)؟
 
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-rug_check_cache = SimpleTTLCache(ttl_seconds=600)  # 10 دقائق (الـ Authorities ما كيتبدلوش بسرعة)
+rug_check_cache = SimpleTTLCache(ttl_seconds=21600)  # 🔧 6 ساعات بدل 10 دقائق — Mint/Freeze Authority ما كيتبدلوش أصلاً بعد الإطلاق، فبلا داعي نعاودو النداء (3 RPC calls) كل شوية لنفس التوكن
 
 
 @with_retry()
@@ -1177,42 +1212,51 @@ async def get_token_authorities(session: aiohttp.ClientSession, mint: str) -> di
     """
     كيجيب Mint Authority و Freeze Authority مباشرة من الـ Mint Account
     (jsonParsed كيعطيهم جاهزين بلا ما نحتاج نفسر Bytes يدوياً).
+
+    🔧 محسّنة: نفس النداء كيعطي زادة الـ Supply (parsed.info.supply/decimals)
+    — يعني ماعادش خاصنا نداء getTokenSupply منفصل (توفير 33% من النداءات
+    ديال Rug Check: من 3 لـ 2).
     """
     result = await _solana_rpc_call(
         session, "getAccountInfo", [mint, {"encoding": "jsonParsed"}]
     )
     if not result or not result.get("value"):
-        return {"mint_authority": None, "freeze_authority": None, "found": False}
+        return {"mint_authority": None, "freeze_authority": None, "found": False, "total_supply_ui": None}
 
     try:
         parsed_info = result["value"]["data"]["parsed"]["info"]
+        raw_supply = parsed_info.get("supply")
+        decimals = parsed_info.get("decimals", 0)
+        total_supply_ui = (float(raw_supply) / (10 ** decimals)) if raw_supply is not None else None
         return {
             "mint_authority": parsed_info.get("mintAuthority"),
             "freeze_authority": parsed_info.get("freezeAuthority"),
             "found": True,
+            "total_supply_ui": total_supply_ui,
         }
-    except (KeyError, TypeError):
-        return {"mint_authority": None, "freeze_authority": None, "found": False}
+    except (KeyError, TypeError, ValueError):
+        return {"mint_authority": None, "freeze_authority": None, "found": False, "total_supply_ui": None}
 
 
-async def get_holder_concentration(session: aiohttp.ClientSession, mint: str) -> float:
+async def get_holder_concentration(session: aiohttp.ClientSession, mint: str, total_supply_ui: float) -> float:
     """
     نسبة (%) اللي كيملكوها أكبر 10 حاملين من إجمالي الـ Supply.
     نسبة عالية = تركيز خطير (شخص وحد أو مجموعة صغيرة يقدرو يهبطو السعر بصفقة وحدة).
-    """
-    largest_result = await _solana_rpc_call(session, "getTokenLargestAccounts", [mint])
-    supply_result = await _solana_rpc_call(session, "getTokenSupply", [mint])
 
-    if not largest_result or not supply_result:
+    🔧 محسّنة: total_supply_ui كتجي جاهزة من get_token_authorities (بلا نداء
+    getTokenSupply منفصل) — توفير كريدي Helius.
+    """
+    if not total_supply_ui or total_supply_ui == 0:
+        return None
+
+    largest_result = await _solana_rpc_call(session, "getTokenLargestAccounts", [mint])
+    if not largest_result:
         return None
 
     try:
         top_accounts = largest_result.get("value", [])[:10]
         top_10_sum = sum(float(acc.get("uiAmount") or 0) for acc in top_accounts)
-        total_supply = float(supply_result.get("value", {}).get("uiAmount") or 0)
-        if total_supply == 0:
-            return None
-        return round((top_10_sum / total_supply) * 100, 1)
+        return round((top_10_sum / total_supply_ui) * 100, 1)
     except (KeyError, TypeError, ZeroDivisionError):
         return None
 
@@ -1220,16 +1264,16 @@ async def get_holder_concentration(session: aiohttp.ClientSession, mint: str) ->
 async def get_rug_check_data(session: aiohttp.ClientSession, mint: str) -> dict:
     """
     🆕 الدالة الرئيسية: كتجمع Mint/Freeze Authority + تركيز الحاملين، مع Cache
-    (10 دقائق) باش ما نبقاوش نطلبو نفس التوكن كل شوية.
+    (6 ساعات) باش ما نبقاوش نطلبو نفس التوكن كل شوية.
+
+    🔧 محسّنة: 2 نداءات RPC بدل 3 (الـ Supply كتجي من نفس نداء Authorities).
     """
     cached = rug_check_cache.get(mint)
     if cached is not None:
         return cached
 
-    authorities, holder_concentration = await asyncio.gather(
-        get_token_authorities(session, mint),
-        get_holder_concentration(session, mint),
-    )
+    authorities = await get_token_authorities(session, mint)
+    holder_concentration = await get_holder_concentration(session, mint, authorities.get("total_supply_ui"))
 
     result = {
         "mint_authority_active": bool(authorities.get("mint_authority")),
@@ -1767,9 +1811,19 @@ def build_trade_message(wallet_name, wallet_address, parsed, market_data, buyers
         if narrative:
             narrative_block = f"💬 <i>{narrative}</i>\n{divider}\n"
 
+    # 🆕 سطر "ملخص سريع" (Quick Glance) — قرار فثانية وحدة بلا ما تحتاج تقرا
+    # كامل الرسالة: Score + حالة الأمان + اتجاه الضغط، كلشي فسطر واحد
+    quick_risk_emoji = "✅"
+    if rug_data is not None:
+        _rs, _rl, _ = calculate_rug_risk(rug_data)
+        quick_risk_emoji = "🔴" if _rs >= 60 else ("🟡" if _rs >= 30 else "✅")
+    quick_score_part = f"{score}/100 {score_label_emoji(score_label)}" if score is not None else "—"
+    quick_glance = f"⚡ <b>{quick_score_part} | أمان {quick_risk_emoji}</b>\n"
+
     text = (
         f"🟢 <b>BUY</b> — 🪙 <b>{symbol}</b>\n"
         f"🕒 {tx_time}\n"
+        f"{quick_glance}"
         f"{divider}\n"
         f"{score_line}"
         f"{rug_line}"
@@ -1799,7 +1853,9 @@ def build_trade_message(wallet_name, wallet_address, parsed, market_data, buyers
         f"{pumpfun_line}"
         f"<a href='{photon}'>Photon</a> · "
         f"<a href='{gmgn}'>GMGN</a> · "
-        f"<a href='{solscan}'>Solscan</a>"
+        f"<a href='{solscan}'>Solscan</a>\n"
+        f"{divider}\n"
+        f"🦇 <i>Batdex Pro</i>"
     )
     return text, usd_value, symbol
 
@@ -1868,12 +1924,14 @@ async def handle_parsed_transaction(session, bot, admin_chat_id, name, address, 
         # يتعاود المحاولة أبداً. دابا: فشل خطوة وحدة ما يأثرش على الباقي،
         # والتنبيه الأساسي ديما يتبعت حتى لو بمعلومات أقل.
 
-        # 🆕 Rug Check (غير BUY يوصل لهنا دابا أصلاً)
+        # 🆕 Rug Check (غير BUY يوصل لهنا دابا أصلاً) — وغير للصفقات لي قيمتها
+        # فوق RUG_CHECK_MIN_USD_VALUE (توفير كريدي Helius من الصفقات الصغيرة)
         rug_data = None
-        try:
-            rug_data = await get_rug_check_data(session, mint)
-        except Exception as e:
-            logger.error(f"⚠️ فشل Rug Check لـ {mint} (كنكملو بلا فحص أمان): {e}")
+        if usd_value >= RUG_CHECK_MIN_USD_VALUE:
+            try:
+                rug_data = await get_rug_check_data(session, mint)
+            except Exception as e:
+                logger.error(f"⚠️ فشل Rug Check لـ {mint} (كنكملو بلا فحص أمان): {e}")
 
         # 🆕 Token Score (بعد ما سجلنا الصفقة، باش الـ Popularity يكون محدّث)
         score, score_label = None, None
@@ -2283,6 +2341,38 @@ async def watchdog_job(context):
             _watchdog_state["alert_sent"] = True
         except Exception as e:
             logger.error(f"❌ حتى تنبيه الـ Watchdog فشل يتبعت: {e}")
+
+
+# ============================================================
+# 💾 نسخة احتياطية تلقائية (حماية من فقدان البيانات)
+# ============================================================
+# 🆕 خدمات بحال Render كتمسح الملفات المحلية (بما فيها wallets.db) فبعض
+# الحالات (Redeploy بلا Persistent Disk). هاد الجوب كيبعت نسخة احتياطية
+# كاملة للأدمن تلقائياً كل 24 ساعة — حتى لو طاحت البيانات، عندك ديما آخر
+# نسخة فـ Telegram (بلا أي تكلفة، بلا أي إعداد إضافي).
+
+AUTO_BACKUP_INTERVAL_SECONDS = 86400  # كل 24 ساعة
+
+
+async def auto_backup_job(context):
+    """كيبعت نسخة احتياطية من قاعدة البيانات للأدمن تلقائياً، مرة فاليوم"""
+    try:
+        backup_path = create_backup(None)
+        wallets_count = len(get_all_wallets())
+        await context.bot.send_document(
+            chat_id=ADMIN_CHAT_ID,
+            document=open(backup_path, "rb"),
+            filename=os.path.basename(backup_path),
+            caption=(
+                f"💾 <b>نسخة احتياطية يومية تلقائية</b>\n"
+                f"📊 {wallets_count} محفظة متابَعة\n"
+                f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            ),
+            parse_mode="HTML",
+        )
+        os.remove(backup_path)  # ننظفو الملف المحلي بعد ما نبعتوه (ماخصناش ننسخو bezzaf)
+    except Exception as e:
+        logger.error(f"❌ فشلت النسخة الاحتياطية التلقائية: {e}")
 
 
 # ============================================================
@@ -3308,6 +3398,27 @@ async def webhook_status_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def monitor_job(context):
     try:
+        # 🆕 Adaptive Throttle: إذا كنا فحالة "راحة" بسبب Rate Limit متكرر،
+        # نتخطاو الدورة كاملة — بلا ما نستهلكو كريدي فالفراغ على حالة معروفة
+        if is_currently_throttled():
+            if not _adaptive_state["alert_sent"]:
+                remaining_min = int((_adaptive_state["throttled_until"] - time.time()) // 60) + 1
+                try:
+                    await context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=(
+                            f"🐢 <b>Adaptive Throttle مفعّل</b>\n\n"
+                            f"حسينا بـ Rate Limit متكرر من Helius، فبطأنا المراقبة تلقائياً "
+                            f"لمدة ~{remaining_min} دقيقة باش نوفرو الكريدي المتبقي.\n"
+                            f"البوت غايرجع للسرعة العادية وحدو."
+                        ),
+                        parse_mode="HTML",
+                    )
+                    _adaptive_state["alert_sent"] = True
+                except Exception:
+                    pass
+            return
+
         was_stalled = _watchdog_state["alert_sent"]  # 🆕 كان الـ Watchdog سبق ونبه على توقف؟
         await check_all_wallets(context.bot, ADMIN_CHAT_ID)
         mark_monitor_success()  # 🆕 كنعلمو الـ Watchdog بلي الدورة نجحت
@@ -3489,6 +3600,8 @@ def build_application() -> Application:
     app.job_queue.run_repeating(evaluate_outcomes_job, interval=EVALUATE_OUTCOMES_INTERVAL_SECONDS, first=120)
     # ---- 🆕 Digest (ملخص الصفقات المفلترة) ----
     app.job_queue.run_repeating(digest_job, interval=DIGEST_INTERVAL_SECONDS, first=DIGEST_INTERVAL_SECONDS)
+    # ---- 🆕 نسخة احتياطية تلقائية يومية (حماية من فقدان البيانات) ----
+    app.job_queue.run_repeating(auto_backup_job, interval=AUTO_BACKUP_INTERVAL_SECONDS, first=300)
 
     return app
 
